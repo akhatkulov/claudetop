@@ -1,0 +1,254 @@
+#!/usr/bin/env bash
+#
+# claudetop — shu qurilmadagi Claude Code hisobining token sarfi,
+# xarajati (API-ekvivalent) va 5-soatlik limit oynasini CLI'da live ko'rsatadi.
+#
+# Ma'lumot manbasi: ~/.claude/projects/**/*.jsonl (real sessiya transkriptlari)
+# va ~/.claude/.credentials.json (obuna turi/tarif — sirlar o'qilmaydi).
+#
+# Foydalanish:
+#   claudetop              live dashboard (TTY bo'lsa avtomatik)
+#   claudetop --once       bir martalik snapshot
+#   claudetop -n 5         5 soniyada yangilash
+#   claudetop --json       xom agregat JSON (skript uchun)
+#   claudetop --no-color   ranglarsiz
+#   claudetop -h           yordam
+#
+set -euo pipefail
+
+VERSION="1.0.0"
+
+# --- skriptni va engine'ni topish (symlink orqali ham) ---
+SELF="$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || echo "${BASH_SOURCE[0]}")"
+SCRIPT_DIR="$(dirname "$SELF")"
+ENGINE="$SCRIPT_DIR/lib/engine.py"
+
+# --- python3 tekshir ---
+PY="${CLAUDETOP_PYTHON:-python3}"
+if ! command -v "$PY" >/dev/null 2>&1; then
+  echo "Xato: python3 topilmadi. O'rnating yoki CLAUDETOP_PYTHON belgilang." >&2
+  exit 1
+fi
+if [[ ! -f "$ENGINE" ]]; then
+  echo "Xato: engine topilmadi: $ENGINE" >&2
+  exit 1
+fi
+
+# --- standart sozlamalar ---
+INTERVAL=3
+MODE=""          # "" = avto (TTY→watch), "watch", "once"
+COLOR=1
+JSON=0
+COMPACT=0
+CSV=0
+REPORT=0
+NOTIFY=0
+VIEW="overview"
+THEME="${CLAUDETOP_THEME:-default}"
+SESSION=""
+SET_LIMITS=()
+
+usage() {
+  cat <<EOF
+claudetop v$VERSION — Claude Code usage/limit live monitor
+
+FOYDALANISH:
+  claudetop [OPSIYALAR]
+
+OPSIYALAR:
+  -w, --watch          live rejim (uzluksiz yangilanadi)
+      --once           bir martalik snapshot va chiqish
+  -c, --compact        bir qatorli xulosa (tmux/statusline uchun)
+      --report         markdown hisobot chiqarish (ulashish/saqlash uchun)
+      --csv            kunlik sarf CSV chiqarish (spreadsheet/BI uchun)
+  -n, --interval SEC   yangilash oralig'i soniyada (standart: $INTERVAL)
+      --view V         boshlang'ich ekran: overview|sessions|activity|trends|insights
+      --session Q      bitta sessiya kartasi (nom/ai-title/id bo'yicha)
+      --theme NAME     rang temasi: default|mono|ocean|matrix|amber
+      --notify         limit 90% ga yetganda desktop bildirishnoma (watch)
+      --set-limit K=V  haqiqiy limitni sozlash (session=N yoki weekly=N) va chiqish
+      --json           xom agregat JSON chiqarish
+      --no-color       ANSI ranglarsiz
+  -h, --help           shu yordam
+  -v, --version        versiya
+
+EKRANLAR (live rejimda raqam bilan almashtiriladi):
+  [1] Umumiy    — limit oynalari, sarf, model/loyiha, 7-kun
+  [2] Sessiya   — jonli ishlab turgan sessiyalar + so'nggilari (ai-title)
+  [3] Faollik   — soat×hafta-kuni issiqlik xaritasi + effort taqsimoti
+  [4] Trend     — 30-kunlik grafik + oylik/yillik prognoz
+  [5] Fikrlar   — avtomatik xulosalar (sur'at, limit traektoriyasi, naqshlar)
+
+TAVSIF:
+  Argumentsiz ishga tushirilsa va terminal interaktiv (TTY) bo'lsa — live
+  rejim. Aks holda bir martalik snapshot. Live rejimda: 1-5 yoki ←/→ (h/l)
+  ekran, 'r' yangilash, '?' yordam, 'q'/Ctrl+C chiqish.
+
+  Xarajat "API-ekvivalent qiymat" sifatida ko'rsatiladi: Max/Pro obunada
+  token uchun to'lanmaydi, bu son shu tokenlar API'da qancha turishini
+  bildiradi (siz obuna evaziga olayotgan qiymat).
+
+HAQIQIY LIMITLAR (ixtiyoriy):
+  Limit foizi standart ravishda "eng gavjum oyna"ga nisbatan (heuristik)
+  ko'rsatiladi. Haqiqiy raqamni Claude Code'da /status dan bilib, quyidagicha
+  sozlang — foiz real bo'ladi:
+    env:    CLAUDETOP_SESSION_LIMIT=880000000 CLAUDETOP_WEEKLY_LIMIT=2000000000
+    config: ~/.config/claudetop/config.json
+            { "session_token_limit": 0, "weekly_token_limit": 0 }
+EOF
+}
+
+# --- argument parsing ---
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -w|--watch)   MODE="watch"; shift ;;
+    --once)       MODE="once"; shift ;;
+    -c|--compact) COMPACT=1; MODE="once"; shift ;;
+    --view)
+      shift
+      [[ $# -gt 0 ]] || { echo "Xato: --view uchun qiymat kerak" >&2; exit 2; }
+      VIEW="$1"; shift ;;
+    --view=*)     VIEW="${1#*=}"; shift ;;
+    --theme)
+      shift
+      [[ $# -gt 0 ]] || { echo "Xato: --theme uchun qiymat kerak" >&2; exit 2; }
+      THEME="$1"; shift ;;
+    --theme=*)    THEME="${1#*=}"; shift ;;
+    --session)
+      shift
+      [[ $# -gt 0 ]] || { echo "Xato: --session uchun nom/id kerak" >&2; exit 2; }
+      SESSION="$1"; MODE="once"; shift ;;
+    --session=*)  SESSION="${1#*=}"; MODE="once"; shift ;;
+    --notify)     NOTIFY=1; shift ;;
+    --set-limit)
+      shift
+      [[ $# -gt 0 ]] || { echo "Xato: --set-limit uchun qiymat kerak (session=N)" >&2; exit 2; }
+      SET_LIMITS+=("$1"); shift ;;
+    --set-limit=*) SET_LIMITS+=("${1#*=}"); shift ;;
+    -n|--interval)
+      shift
+      [[ $# -gt 0 ]] || { echo "Xato: -n uchun qiymat kerak" >&2; exit 2; }
+      INTERVAL="$1"; shift ;;
+    --interval=*) INTERVAL="${1#*=}"; shift ;;
+    --json)       JSON=1; MODE="once"; shift ;;
+    --csv)        CSV=1; MODE="once"; shift ;;
+    --report)     REPORT=1; MODE="once"; shift ;;
+    --no-color)   COLOR=0; shift ;;
+    -h|--help)    usage; exit 0 ;;
+    -v|--version) echo "claudetop v$VERSION"; exit 0 ;;
+    *) echo "Noma'lum opsiya: $1" >&2; usage >&2; exit 2 ;;
+  esac
+done
+
+# interval validatsiya
+if ! [[ "$INTERVAL" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
+  echo "Xato: interval musbat son bo'lishi kerak: $INTERVAL" >&2
+  exit 2
+fi
+
+# --set-limit berilgan bo'lsa: sozlab, chiqamiz
+if [[ ${#SET_LIMITS[@]} -gt 0 ]]; then
+  sl_args=()
+  for p in "${SET_LIMITS[@]}"; do sl_args+=(--set-limit "$p"); done
+  exec "$PY" "$ENGINE" "${sl_args[@]}"
+fi
+
+# rejimni aniqlash
+if [[ -z "$MODE" ]]; then
+  if [[ -t 1 ]]; then MODE="watch"; else MODE="once"; fi
+fi
+
+# engine argumentlari
+engine_args=()
+[[ $JSON -eq 1 ]] && engine_args+=(--json)
+[[ $CSV -eq 1 ]] && engine_args+=(--csv)
+[[ $REPORT -eq 1 ]] && engine_args+=(--report)
+[[ $COMPACT -eq 1 ]] && engine_args+=(--compact)
+[[ $NOTIFY -eq 1 ]] && engine_args+=(--notify)
+[[ $COLOR -eq 0 ]] && engine_args+=(--no-color)
+[[ -n "$SESSION" ]] && engine_args+=(--session "$SESSION")
+engine_args+=(--theme "$THEME")
+
+term_cols() {
+  local n
+  n="$(tput cols 2>/dev/null || true)"
+  [[ -z "$n" ]] && n="${COLUMNS:-80}"
+  echo "$n"
+}
+
+term_lines() {
+  local n
+  n="$(tput lines 2>/dev/null || true)"
+  [[ -z "$n" ]] && n="${LINES:-24}"
+  echo "$n"
+}
+
+run_engine() {
+  # snapshot: enni uzatamiz, balandlik cheklanmaydi (to'liq chiqadi)
+  "$PY" "$ENGINE" "${engine_args[@]}" --view "$VIEW" --width "$(term_cols)"
+}
+
+run_engine_live() {
+  # live: en + balandlik + joriy ekran; o'lcham/ekran o'zgarsa moslashadi
+  "$PY" "$ENGINE" "${engine_args[@]}" --view "$VIEW" \
+    --width "$(term_cols)" --height "$(term_lines)"
+}
+
+# --- ONCE / JSON rejimi ---
+if [[ "$MODE" == "once" ]]; then
+  run_engine
+  exit $?
+fi
+
+# --- WATCH (live) rejimi ---
+cleanup() {
+  # kursor va oddiy ekranni tiklash
+  tput cnorm 2>/dev/null || printf '\033[?25h'
+  tput rmcup 2>/dev/null || printf '\033[?1049l'
+  exit 0
+}
+trap cleanup INT TERM EXIT
+
+# alternativ ekran buferi + kursorni yashirish
+tput smcup 2>/dev/null || printf '\033[?1049h'
+tput civis 2>/dev/null || printf '\033[?25l'
+
+# ekranlar tartibi (strelka bilan aylantirish uchun)
+VIEWS_ARR=(overview sessions activity trends insights)
+VIDX=0
+for i in "${!VIEWS_ARR[@]}"; do [[ "${VIEWS_ARR[$i]}" == "$VIEW" ]] && VIDX=$i; done
+
+first=1
+while true; do
+  frame="$(run_engine_live 2>&1)" || frame="engine xatosi:\n$frame"
+  # birinchi kadr — to'liq tozalash; keyingilari — kursorni boshiga (miltillashsiz)
+  if [[ $first -eq 1 ]]; then
+    printf '\033[2J\033[H'
+    first=0
+  else
+    printf '\033[H'
+  fi
+  printf '%s\n' "$frame"
+  printf '\033[J'   # kursordan pastdagi eski qoldiqlarni tozalash
+
+  # intervalni kutish; tugma bosilsa darhol qayta chizamiz (read sleep vazifasini ham bajaradi)
+  if read -rsn1 -t "$INTERVAL" key 2>/dev/null; then
+    # strelka = ESC[C/ESC[D — qolgan 2 baytni tez o'qib olamiz
+    if [[ "$key" == $'\e' ]]; then
+      read -rsn2 -t 0.02 rest 2>/dev/null || rest=""
+      key="$key$rest"
+    fi
+    case "$key" in
+      q|Q) break ;;
+      1) VIDX=0; VIEW="${VIEWS_ARR[0]}" ;;
+      2) VIDX=1; VIEW="${VIEWS_ARR[1]}" ;;
+      3) VIDX=2; VIEW="${VIEWS_ARR[2]}" ;;
+      4) VIDX=3; VIEW="${VIEWS_ARR[3]}" ;;
+      5) VIDX=4; VIEW="${VIEWS_ARR[4]}" ;;
+      $'\e[C'|l|L) VIDX=$(( (VIDX + 1) % 5 )); VIEW="${VIEWS_ARR[$VIDX]}" ;;  # keyingi
+      $'\e[D'|h|H) VIDX=$(( (VIDX + 4) % 5 )); VIEW="${VIEWS_ARR[$VIDX]}" ;;  # oldingi
+      '?') VIEW="help" ;;                          # yordam overlay
+      r|R) VIEW="${VIEWS_ARR[$VIDX]}" ;;           # darhol yangilash / help'dan qaytish
+    esac
+  fi
+done
