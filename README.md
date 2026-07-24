@@ -1,5 +1,8 @@
 # claudetop
 
+[![QA](https://github.com/akhatkulov/claudetop/actions/workflows/qa.yml/badge.svg)](https://github.com/akhatkulov/claudetop/actions/workflows/qa.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+
 **`htop` for Claude Code** — a live terminal dashboard for your Claude Code usage,
 limits, cost and analytics. Reads your local `~/.claude` data — no API calls, no
 network, no secrets leave your machine.

@@ -1,0 +1,47 @@
+name: QA
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+
+      - name: Bash syntax check
+        run: bash -n claudetop && bash -n install.sh && bash -n completions/claudetop.bash
+
+      - name: Python compile check
+        run: python3 -m py_compile lib/engine.py .qa/verify.py .qa/make_fixture.py
+
+      - name: Build fixture
+        run: python3 .qa/make_fixture.py "$RUNNER_TEMP/fakehome"
+
+      - name: Run QA (alignment, overflow, themes, exports)
+        env:
+          HOME: ${{ runner.temp }}/fakehome
+          XDG_CACHE_HOME: ${{ runner.temp }}/fakehome/.cache
+          XDG_CONFIG_HOME: ${{ runner.temp }}/fakehome/.config
+        run: python3 .qa/verify.py
+
+      - name: Smoke-test all export modes
+        env:
+          HOME: ${{ runner.temp }}/fakehome
+          XDG_CACHE_HOME: ${{ runner.temp }}/fakehome/.cache
+          XDG_CONFIG_HOME: ${{ runner.temp }}/fakehome/.config
+        run: |
+          ./claudetop --once --no-color > /dev/null
+          ./claudetop --compact --no-color
+          ./claudetop --json    > /dev/null
+          ./claudetop --csv     > /dev/null
+          ./claudetop --report  > /dev/null
+          ./claudetop --view insights --no-color > /dev/null
