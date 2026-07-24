@@ -26,14 +26,17 @@ CONFIG_FILE = os.path.join(CONFIG_DIR, "config.json")
 
 
 def load_limits():
-    """Foydalanuvchi sozlagan haqiqiy token limitlari (0 = heuristik ishlatiladi).
+    """Foydalanuvchi sozlagan haqiqiy token limitlari (0 = heuristik ishlatiladi)
+    va haftalik reset vaqti (standart: Dushanba 00:00).
     Ustuvorlik: env > config.json. Claude Code'da /status buni ko'rsatadi."""
-    lim = {"session": 0, "weekly": 0}
+    lim = {"session": 0, "weekly": 0, "reset_wd": 0, "reset_hr": 0}
     try:
         with open(CONFIG_FILE) as f:
             cfg = json.load(f)
         lim["session"] = int(cfg.get("session_token_limit", 0) or 0)
         lim["weekly"] = int(cfg.get("weekly_token_limit", 0) or 0)
+        lim["reset_wd"] = int(cfg.get("weekly_reset_weekday", 0) or 0) % 7
+        lim["reset_hr"] = int(cfg.get("weekly_reset_hour", 0) or 0) % 24
     except Exception:
         pass
     try:
@@ -41,9 +44,36 @@ def load_limits():
             lim["session"] = int(os.environ["CLAUDETOP_SESSION_LIMIT"])
         if os.environ.get("CLAUDETOP_WEEKLY_LIMIT"):
             lim["weekly"] = int(os.environ["CLAUDETOP_WEEKLY_LIMIT"])
+        if os.environ.get("CLAUDETOP_WEEKLY_RESET_WEEKDAY"):
+            lim["reset_wd"] = int(os.environ["CLAUDETOP_WEEKLY_RESET_WEEKDAY"]) % 7
+        if os.environ.get("CLAUDETOP_WEEKLY_RESET_HOUR"):
+            lim["reset_hr"] = int(os.environ["CLAUDETOP_WEEKLY_RESET_HOUR"]) % 24
     except ValueError:
         pass
     return lim
+
+
+def week_window(summ, wd=0, hr=0):
+    """Belgilangan reset (hafta kuni wd: 0=Dushanba, soat hr) bo'yicha JORIY
+    haftalik oyna: {tokens, cost, last, next, elapsed_frac, remaining}."""
+    now = summ["now_local"]
+    days_back = (now.weekday() - wd) % 7
+    last = (now - timedelta(days=days_back)).replace(
+        hour=hr, minute=0, second=0, microsecond=0)
+    if last > now:
+        last -= timedelta(days=7)
+    nxt = last + timedelta(days=7)
+    ad, adc = summ["all_day"], summ["all_day_cost"]
+    tokens = cost = 0
+    d = last.date()
+    while d <= now.date():
+        tokens += ad.get(d.isoformat(), 0)
+        cost += adc.get(d.isoformat(), 0)
+        d += timedelta(days=1)
+    total = (nxt - last).total_seconds()
+    return {"tokens": tokens, "cost": cost, "last": last, "next": nxt,
+            "elapsed_frac": (now - last).total_seconds() / total,
+            "remaining": (nxt - now).total_seconds()}
 
 # 5 soatlik rolling sessiya oynasi (Claude usage limiti shu oynaga bog'liq)
 BLOCK_HOURS = 5
@@ -572,6 +602,19 @@ def delta_str(cur, prev, c):
     return c["gray"] + f"={d:+.0f}%" + c["reset"]
 
 
+def dur_days(seconds):
+    """Uzoq muddat: 3k 8s / 8s 20m ko'rinishida (kun+soat)."""
+    seconds = int(max(0, seconds))
+    d = seconds // 86400
+    h = (seconds % 86400) // 3600
+    m = (seconds % 3600) // 60
+    if d:
+        return f"{d}k {h}s"
+    if h:
+        return f"{h}s {m}m"
+    return f"{m}m"
+
+
 def dur(seconds):
     seconds = int(max(0, seconds))
     h = seconds // 3600
@@ -753,6 +796,8 @@ def render(summ, creds, limits=None, color=True, live_hint=True, width=None, hei
     # ---- limit hisob-kitoblari (banner + LIMIT bo'limi uchun oldindan) ----
     active = summ["active"]
     frac_lim = 0.0
+    sess_time_frac = 0.0
+    sess_reset = None
     if active:
         remaining = (active["end"] - summ["now"]).total_seconds()
         elapsed = (summ["now"] - active["start"]).total_seconds()
@@ -761,9 +806,13 @@ def render(summ, creds, limits=None, color=True, live_hint=True, width=None, hei
         frac_lim = (tok / sess_lim) if sess_lim else 0
         rate = tok / elapsed if elapsed > 0 else 0
         projected = tok + rate * remaining
-    wk = summ["week"]["tokens"]
+        sess_time_frac = elapsed / BLOCK_SECONDS
+        sess_reset = active["end"].astimezone()
+    ww = week_window(summ, limits.get("reset_wd", 0), limits.get("reset_hr", 0))
+    wk = ww["tokens"]
     wk_lim = limits["weekly"] if limits["weekly"] > 0 else summ["weekly_baseline"]
     frac_wk = (wk / wk_lim) if wk_lim else 0
+    wk_time_frac = ww["elapsed_frac"]
     worst = max(frac_lim, frac_wk) * 100
 
     # ---- bo'limlarni qatorlar ro'yxati sifatida quramiz (muhimlik tartibida) ----
@@ -782,31 +831,38 @@ def render(summ, creds, limits=None, color=True, live_hint=True, width=None, hei
 
     # ================= EKRAN 1: UMUMIY =================
     def mk_overview():
-        lim = [c["bold"] + " LIMIT OYNALARI" + c["reset"], ""]
+        wd = ["Du", "Se", "Ch", "Pa", "Ju", "Sh", "Ya"]
+        ind = "              "   # detal qatorlar chekinishi (prefiks ostiga)
+        lim = [c["bold"] + " LIMIT OYNALARI" + c["reset"]
+               + c["gray"] + "  (sarf + reset gacha vaqt)" + c["reset"], ""]
+        # ---- 5-SOATLIK OYNA: 2 chart (sarf, vaqt) ----
         if active:
-            basis = "sozlangan limit" if limits["session"] > 0 else "eng gavjum oynaga nisbatan"
+            sbasis = "sozlangan" if limits["session"] > 0 else "heuristik"
+            lim.append(fillbar(" 5-soat sarf ", f" {frac_lim*100:4.0f}%", frac_lim, c["bgreen"]))
+            lim.append(c["gray"] + ind + f"{human_tokens(tok)} tk · {money(active['cost'])}"
+                       + f"  ({sbasis} limit)" + c["reset"])
+            eta_txt = ""
             if sess_lim and rate > 0 and projected >= sess_lim:
                 eta = (sess_lim - tok) / rate
                 ecol = c["bred"] if eta <= remaining else c["byellow"]
-                proj = ecol + f"~{dur(eta)} da limitga yetadi" + c["reset"]
-            else:
-                proj = c["gray"] + f"~{human_tokens(projected)} proyeksiya" + c["reset"]
-            lim += [
-                fillbar(" 5-soat ", f" {frac_lim*100:4.0f}%", frac_lim, c["bgreen"]),
-                c["gray"] + lr(f"        {human_tokens(tok)} tk · {money(active['cost'])}",
-                               f"{dur(remaining)} qoldi ") + c["reset"],
-                c["gray"] + f"        {human_tokens(rate*60)}/daq · " + proj
-                + c["gray"] + f"  ({basis})" + c["reset"],
-            ]
+                eta_txt = ecol + f"  · limitga ~{dur(eta)}" + c["reset"]
+            lim.append(fillbar(" 5-soat vaqt ", f" {sess_time_frac*100:4.0f}%",
+                               sess_time_frac, c["bblue"]))
+            lim.append(c["gray"] + ind + f"reset {sess_reset.strftime('%H:%M')}"
+                       + f" · {dur(remaining)} qoldi" + c["reset"] + eta_txt)
         else:
-            lim.append(c["gray"] + " 5-soat  hozir aktiv oyna yo'q" + c["reset"])
-        wbasis = "sozlangan limit" if limits["weekly"] > 0 else "eng gavjum 7-kunga nisbatan"
-        lim += [
-            "",
-            fillbar(" 7-kun  ", f" {frac_wk*100:4.0f}%", frac_wk, c["bmag"]),
-            c["gray"] + f"        {human_tokens(wk)} tk · {money(summ['week']['cost'])}"
-            + f"  ({wbasis})" + c["reset"],
-        ]
+            lim.append(c["gray"] + " 5-soat: hozir aktiv oyna yo'q" + c["reset"])
+        lim.append("")
+        # ---- 7-KUNLIK OYNA: 2 chart (sarf, vaqt) ----
+        wbasis = "sozlangan" if limits["weekly"] > 0 else "heuristik"
+        lim.append(fillbar(" 7-kun  sarf ", f" {frac_wk*100:4.0f}%", frac_wk, c["bmag"]))
+        lim.append(c["gray"] + ind + f"{human_tokens(wk)} tk · {money(ww['cost'])}"
+                   + f"  ({wbasis} limit)" + c["reset"])
+        lim.append(fillbar(" 7-kun  vaqt ", f" {wk_time_frac*100:4.0f}%",
+                           wk_time_frac, c["bblue"]))
+        rl = ww["next"]
+        lim.append(c["gray"] + ind + f"reset {wd[rl.weekday()]} {rl.strftime('%H:%M')}"
+                   + f" · {dur_days(ww['remaining'])} qoldi" + c["reset"])
 
         sarf = [c["bold"] + " SARF " + c["reset"] + c["gray"] + "(token · API-ekvivalent qiymat)"
                 + c["reset"], ""]
@@ -1011,14 +1067,21 @@ def render(summ, creds, limits=None, color=True, live_hint=True, width=None, hei
         else:
             HOL.append(c["gray"] + f" • Bugun hozircha {human_tokens(today_tok)}"
                        + " (erta — proyeksiya hali beqaror)" + c["reset"])
-        # haftalik limit traektoriyasi
-        drate = wk / 7.0
+        # haftalik limit traektoriyasi (joriy hafta sur'ati bo'yicha)
+        elapsed_days = max(0.25, wk_time_frac * 7)
+        drate = wk / elapsed_days
+        days_to_reset = ww["remaining"] / 86400
         if wk_lim and wk >= wk_lim:
             HOL.append(c["bred"] + " ⚠ Haftalik limit oshib ketgan" + c["reset"])
         elif wk_lim and drate > 0 and wk < wk_lim:
             dleft = (wk_lim - wk) / drate
-            col = c["bred"] if dleft <= 2 else (c["byellow"] if dleft <= 4 else c["gray"])
-            HOL.append(col + f" • Shu sur'atda haftalik limitga ~{dleft:.1f} kun" + c["reset"])
+            if dleft <= days_to_reset:
+                col = c["bred"] if dleft <= 1 else c["byellow"]
+                HOL.append(col + f" • Shu sur'atda haftalik limitga ~{dleft:.1f} kunda yetadi"
+                           + c["reset"])
+            else:
+                HOL.append(c["gray"] + " • Shu sur'atda hafta limitiga yetmaysiz (reset avval)"
+                           + c["reset"])
         # hafta-hafta solishtirish (to'liq 7-kunlik oynalar — halol)
         ad = summ["all_day"]
         td = now.date()
@@ -1271,14 +1334,15 @@ def render(summ, creds, limits=None, color=True, live_hint=True, width=None, hei
 
 
 def limit_fractions(summ, limits):
-    """(5-soat ulushi, 7-kun ulushi, eng yuqori foiz) qaytaradi."""
+    """(5-soat sarf ulushi, 7-kun sarf ulushi, eng yuqori foiz) qaytaradi."""
     active = summ["active"]
     fl = 0.0
     if active:
         sess_lim = limits["session"] if limits["session"] > 0 else summ["baseline"]
         fl = (active["tokens"] / sess_lim) if sess_lim else 0
+    ww = week_window(summ, limits.get("reset_wd", 0), limits.get("reset_hr", 0))
     wk_lim = limits["weekly"] if limits["weekly"] > 0 else summ["weekly_baseline"]
-    fw = (summ["week"]["tokens"] / wk_lim) if wk_lim else 0
+    fw = (ww["tokens"] / wk_lim) if wk_lim else 0
     return fl, fw, max(fl, fw) * 100
 
 
@@ -1326,7 +1390,8 @@ def set_limits(pairs):
             cfg = json.load(f)
     except Exception:
         cfg = {}
-    keymap = {"session": "session_token_limit", "weekly": "weekly_token_limit"}
+    keymap = {"session": "session_token_limit", "weekly": "weekly_token_limit",
+              "reset_weekday": "weekly_reset_weekday", "reset_hour": "weekly_reset_hour"}
     changed = []
     for pair in pairs or []:
         if "=" not in pair:
@@ -1335,7 +1400,8 @@ def set_limits(pairs):
         k, v = pair.split("=", 1)
         k = k.strip().lower()
         if k not in keymap:
-            sys.stderr.write(f"Xato: noma'lum kalit '{k}' (session|weekly)\n")
+            sys.stderr.write(f"Xato: noma'lum kalit '{k}' "
+                             "(session|weekly|reset_weekday|reset_hour)\n")
             return 2
         try:
             cfg[keymap[k]] = int(v)
@@ -1370,9 +1436,9 @@ def render_compact(summ, limits=None, color=True, theme="default"):
         parts.append(col + f"5h {frac:.0f}%" + c["reset"])
     else:
         parts.append(c["gray"] + "5h idle" + c["reset"])
-    wk = summ["week"]["tokens"]
+    ww = week_window(summ, limits.get("reset_wd", 0), limits.get("reset_hr", 0))
     wk_lim = limits["weekly"] if limits["weekly"] > 0 else summ["weekly_baseline"]
-    fwk = (wk / wk_lim * 100) if wk_lim else 0
+    fwk = (ww["tokens"] / wk_lim * 100) if wk_lim else 0
     parts.append(c["bmag"] + f"7d {fwk:.0f}%" + c["reset"])
     parts.append(c["gray"] + f"bugun {human_tokens(summ['today']['tokens'])} "
                  + money(summ['today']['cost']) + c["reset"])
@@ -1387,12 +1453,20 @@ def to_json(summ, creds, limits=None):
         }
     active = summ["active"]
     limits = limits or {"session": 0, "weekly": 0}
+    ww = week_window(summ, limits.get("reset_wd", 0), limits.get("reset_hr", 0))
     return json.dumps({
         "plan": creds["plan"], "tier": creds["tier"],
         "generated_at": summ["now_local"].isoformat(),
         "entry_count": summ["entry_count"],
         "today": summ["today"], "week": summ["week"], "all": summ["all"],
         "limits": limits,
+        "week_window": {
+            "tokens": ww["tokens"], "cost": round(ww["cost"], 4),
+            "reset_at": ww["next"].isoformat(),
+            "elapsed_frac": round(ww["elapsed_frac"], 4),
+            "remaining_seconds": int(ww["remaining"]),
+        },
+        "session_reset_at": (active["end"].isoformat() if active else None),
         "baseline_block_tokens": summ["baseline"],
         "weekly_baseline_tokens": summ["weekly_baseline"],
         "active_block": blk(active) if active else None,
@@ -1431,12 +1505,20 @@ def to_report(summ, creds, limits):
     L.append("")
     L.append("## Limit oynalari")
     L.append("")
-    L.append("| Oyna | Foiz | Asos |")
-    L.append("|---|---|---|")
+    ww = week_window(summ, limits.get("reset_wd", 0), limits.get("reset_hr", 0))
+    active = summ["active"]
     sb = "sozlangan" if limits["session"] > 0 else "heuristik"
     wb = "sozlangan" if limits["weekly"] > 0 else "heuristik"
-    L.append(f"| 5-soat | {fl*100:.0f}% | {sb} |")
-    L.append(f"| 7-kun | {fw*100:.0f}% | {wb} |")
+    s_reset = active["end"].astimezone().strftime("%H:%M") if active else "—"
+    w_reset = ww["next"].strftime("%Y-%m-%d %H:%M")
+    L.append("| Oyna | Sarf | Asos | Reset gacha | Reset vaqti |")
+    L.append("|---|---|---|---|---|")
+    if active:
+        L.append(f"| 5-soat | {fl*100:.0f}% | {sb} | "
+                 f"{dur((active['end'] - summ['now']).total_seconds())} | {s_reset} |")
+    else:
+        L.append(f"| 5-soat | — | {sb} | (aktiv oyna yo'q) | — |")
+    L.append(f"| 7-kun | {fw*100:.0f}% | {wb} | {dur_days(ww['remaining'])} | {w_reset} |")
     L.append("")
     L.append("## Sarf (token · API-ekvivalent qiymat)")
     L.append("")

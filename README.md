@@ -9,12 +9,15 @@ network, no secrets leave your machine.
 │  claudetop  ·  live usage & limits                             Max · Max 5×│
 │  2026-07-24 14:55:33 +05                                                   │
 ├────────────────────────────────────────────────────────────────────────────┤
-│  LIMIT OYNALARI                                                            │
-│  5-soat ████████████████████████░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░   39%│
-│         162.94M tk · $143.92                                   4h 4m qoldi │
-│         2.93M/daq · ~1h 27m da limitga yetadi  (eng gavjum oynaga nisbatan)│
-│  7-kun  █████████████████████████████████████████████░░░░░░░░░░░░░░░░   73%│
-│         1.43B tk · $1,066.42                                               │
+│  LIMIT OYNALARI  (sarf + reset gacha vaqt)                                 │
+│  5-soat sarf ██████████████████████████░░░░░░░░░░░░░░░░░░░░░░░░░░░░░   54%│
+│               228.20M tk · $191.18  (heuristik limit)                      │
+│  5-soat vaqt █████████████░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░   23%│
+│               reset 19:00 · 3h 52m qoldi  · limitga ~57m                   │
+│  7-kun  sarf ███████████████████████████████████████████░░░░░░░░░░░░░   76%│
+│               1.49B tk · $1,113.67  (heuristik limit)                      │
+│  7-kun  vaqt █████████████████████████████████████░░░░░░░░░░░░░░░░░░░   66%│
+│               reset Du 00:00 · 2k 8s qoldi                                 │
 ├────────────────────────────────────────────────────────────────────────────┤
 │  SARF (token · API-ekvivalent qiymat)                                      │
 │  Bugun      473.76M       $357.60                                          │
@@ -40,8 +43,10 @@ dashboard — like `htop`, but for Claude Code.
 
 ## Features
 
-- **Live limit windows** — 5-hour + 7-day usage with **ETA-to-limit** ("~1h 27m at
-  this rate"), burn rate, and a color warning banner at 75% / 90%.
+- **Live limit windows** — for both the **5-hour** and **weekly** windows you get
+  **two separate bars**: one for **usage** (% + tokens + cost) and one for **time to
+  reset** (% elapsed + exact reset time + countdown) — 4 clear gauges. Plus
+  **ETA-to-limit** ("~1h 1m at this rate"), burn rate, and a warning banner at 75%/90%.
 - **5 interactive screens** (switch with number keys or `←`/`→`):
   - **Overview** — limits, spend, models, projects, last 7 days
   - **Sessions** — **live running** Claude Code processes (busy/idle + uptime) plus
@@ -102,6 +107,15 @@ window) because the exact token cap isn't stored locally. Read your real numbers
 claudetop --set-limit session=880000000 --set-limit weekly=2000000000
 # or env: CLAUDETOP_SESSION_LIMIT=... CLAUDETOP_WEEKLY_LIMIT=...
 # or config: ~/.config/claudetop/config.json
+```
+
+The **time-to-reset** bars are always exact. The 5-hour reset is derived from the
+active window; the weekly reset defaults to **Monday 00:00 local** and is configurable
+(check `/status` for your real reset):
+
+```bash
+claudetop --set-limit reset_weekday=3 --set-limit reset_hour=9   # e.g. Thursday 09:00
+# weekday: 0=Mon … 6=Sun
 ```
 
 ## tmux / statusline
